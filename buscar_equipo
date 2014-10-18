@@ -7,12 +7,19 @@ use Net::SNMP qw(:snmp);
 use Data::Dumper;
 use IO::Interface::Simple;
 use Net::ARP;
+use Net::SSH::Perl;
 
 my $switches;
+my $aps;
+my $ApUsuario = 'admin';
+my $ApPassword = 'ws!2004erilink';
+my $SshCmd = 'wlanconfig ath0 list station';
 #my $result;
 #my @columns = ();
 
-my %MacTable;
+#my %MacTable;
+my %PuertoAnalizado;
+my $MacBuscado;
 
 my $OIDdot1dTpFdbTable = '1.3.6.1.2.1.17.4.3';
 
@@ -34,6 +41,12 @@ foreach my $arg (@ARGV) {
 
 my @interfaces = IO::Interface::Simple->interfaces;
 
+
+#
+# Establezco los datos de los equipos que debo
+# buscar ("targets"). El dato que se va a utilizar
+# para encontrarlos, es la MAC address
+#
 print "\nAnalizando formato de los argumentos ...\n\n";
 foreach my $target (keys %targets) {
 	if ($target =~ m/^([01]?\d\d?|2[0-4]\d|25[0-5])\.([01]?\d\d?|2[0-4]\d|25[0-5])\.([01]?\d\d?|2[0-4]\d|25[0-5])\.([01]?\d\d?|2[0-4]\d|25[0-5])$/) {
@@ -60,13 +73,17 @@ foreach my $target (keys %targets) {
 			print STDERR "---->Buscando IP en interfaz $if\n" if $debug;
 
 			my $mac = Net::ARP::arp_lookup($if,$target);
-			if ($mac ne 'unknown') {
+			if (($mac ne 'unknown') && ($mac ne '00:00:00:00:00:00')) {
 				print STDERR "---->Reemplazando búsqueda por MAC Adddress $mac\n" if $debug;
 				$mac =~ s/-//g;
 				$mac =~ s/://g;
 				$targets{$target} = uc($mac);
 				last;
 			}
+		}
+		if ($targets{$target} eq $target) {
+			print STDERR "\n\nNo se encontró MAC address para $target. Saliendo\n\n";
+			exit(0);
 		}
 	} elsif ($target =~ m/^(([0-9A-Fa-f][0-9A-Fa-f][-:]){5}[0-9A-Fa-f][0-9A-Fa-f])|(([0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f].){2}[0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f])$/) {
 		print STDERR "MAC Address: $target\n" if $debug;
@@ -81,70 +98,274 @@ foreach my $target (keys %targets) {
 }
 print "\n\n";
 
+
+#
+# Obtiene los datos de los nodos que conforman
+# la topología de red del sitio.
+#
 my $dbh = DBI->connect("DBI:mysql:$dbbase;host=$dbhost", $dbuser, $dbpass) || die "Could not connect to database: $DBI::errstr";
 
-my $sql_statement = "SELECT * FROM switches ORDER BY nombre";
+#my $sql_statement = "SELECT * FROM switches ORDER BY nombre";
+my $sql_statement = "SELECT ip, nombre, conectado, snmpro as usuario FROM switches ORDER BY nombre";
 
 my $sth = $dbh->prepare($sql_statement);
 $sth->execute();
 
 # Recorre la tabla con el listado de switchs, y obtiene
 # la información de configuración relevante
-if ($sth->rows != 0) {
-	$switches = $sth->fetchall_hashref('nombre');
-	foreach my $switch (keys(%{$switches})) {
-		print STDERR "Switch $switches->{$switch}->{'nombre'} con IP $switches->{$switch}->{'ip'}" if $debug;
+if ($sth->rows == 0) {
+	print STDERR "No se encontraron nodos de red definidos. El equipo buscado puede estar en cualquier lado\n\n";
+	exit(0);
+}
 
-		if ($switches->{$switch}->{'conectado'} =~ m/eth/) {
-			print STDERR " principal conectado a la interfaz $switches->{$switch}->{'conectado'}\n" if $debug;
+$switches = $sth->fetchall_hashref('nombre');
+foreach my $switch (keys(%{$switches})) {
+	$switches->{$switch}->{'es switch'} = 1;
+}
+
+
+#$sql_statement = "SELECT * FROM aps ORDER BY nombre";
+$sql_statement = "SELECT ip, ubicacion as nombre, conectado, '$ApUsuario' as usuario FROM aps ORDER BY nombre";
+
+$sth = $dbh->prepare($sql_statement);
+$sth->execute();
+
+# Recorre la tabla con el listado de switchs, y obtiene
+# la información de configuración relevante
+#if ($sth->rows == 0) {
+#	print STDERR "No se encontraron nodos de red definidos. El equipo buscado puede estar en cualquier lado\n\n";
+#	exit(0);
+#}
+
+$aps = $sth->fetchall_hashref('nombre');
+foreach my $ap (keys(%{$aps})) {
+	$aps->{$ap}->{'es switch'} = 0;
+}
+#print Dumper(%{$aps});
+
+my %equipos = (%{$switches}, %{$aps}); 
+
+#print Dumper(%equipos);
+#exit;
+
+foreach my $target (keys %targets) {
+	$MacBuscado = $targets{$target};
+
+	#
+	# Para la primer búsqueda, propopngo un nodo
+	# raiz de la topología de red
+	#
+	my @nodos_a_analizar = ();
+
+	foreach my $equipo (keys(%equipos)) {
+		if ($equipos{$equipo}->{'es switch'}) {
+			print STDERR "Switch $equipos{$equipo}->{'nombre'} con IP $equipos{$equipo}->{'ip'}" if $debug;
 		} else {
-			print STDERR " conectado en cascada al switch $switches->{$switch}->{'conectado'}\n" if $debug;
+			print STDERR "AP $equipos{$equipo}->{'nombre'} con IP $equipos{$equipo}->{'ip'}" if $debug;
 		}
 
-		if ($switches->{$switch}->{'snmpro'} eq '') {
-			print STDERR "---->(no tiene SNMP)\n" if $debug;
+		if ($equipos{$equipo}->{'conectado'} =~ m/eth/) {
+			print STDERR " principal conectado a la interfaz $equipos{$equipo}->{'conectado'}\n" if $debug;
+
+			# No puedo consultar equipo si no tiene IP de gestión
+			next if ($equipos{$equipo}->{'ip'} !~ m/^([01]?\d\d?|2[0-4]\d|25[0-5])\.([01]?\d\d?|2[0-4]\d|25[0-5])\.([01]?\d\d?|2[0-4]\d|25[0-5])\.([01]?\d\d?|2[0-4]\d|25[0-5])$/);
+
+			# No puedo consultar si es switch y no tiene SNMP
+			next if (($equipos{$equipo}->{'es switch'}) && ($equipos{$equipo}->{'usuario'} eq ''));
+
+print STDERR "\n\nAGREGO $equipos{$equipo}->{'nombre'} con IP $equipos{$equipo}->{'ip'}\n" if $debug;
+			push(@nodos_a_analizar,  $equipos{$equipo}->{'nombre'});
 		} else {
-			print STDERR "---->SNMP ro: $switches->{$switch}->{'snmpro'}\n" if $debug;
+			print STDERR " conectado en cascada al equipo $equipos{$equipo}->{'conectado'}\n" if $debug;
+		}
+		if ($equipos{$equipo}->{'usuario'} eq '') {
+			if ($equipos{$equipo}->{'es switch'}) {
+				print STDERR "---->(no tiene SNMP)\n" if $debug;
+			} else {
+				print STDERR "---->(no tiene usuario administrador)\n" if $debug;
+			}
+		} else {
+			if ($equipos{$equipo}->{'es switch'}) {
+				print STDERR "---->SNMP ro: $equipos{$equipo}->{'usuario'}\n" if $debug;
+			} else {
+				print STDERR "---->ADMIN: $equipos{$equipo}->{'usuario'}\n" if $debug;
+			}
+		}
+	}
+
+#	print "SON ".scalar @nodos_a_analizar."\n";
+#exit;
+	if ((scalar @nodos_a_analizar) == 0) {
+		print STDERR "No se encontraron nodos raiz en la topología de red. No se puede empezar la búsquead\n\n";
+		exit(0);
+	}
+
+	#print Dumper(@nodos_a_analizar) if $debug;
+	my $equipo_analizado = $nodos_a_analizar[0];
+
+	# Repite el proceso mientras haya un equipo propuesto
+	# para seguir buscando
+	while ($equipo_analizado ne '') {
+		print STDERR "Analizando equipo $equipo_analizado con IP $equipos{$equipo_analizado}->{'ip'}\n";
+		if ($equipos{$equipo_analizado}->{'es switch'}) {
+		
 			print STDERR "-------->TABLA MAC:\n" if $debug;
 			my ($session, $error) = Net::SNMP->session(
 				-version  => 'snmpv2c',
 				-nonblocking  => 1,
-				-hostname  => $switches->{$switch}->{'ip'},
-				-community => $switches->{$switch}->{'snmpro'}
+				-hostname  => $equipos{$equipo_analizado}->{'ip'},
+				-community => $equipos{$equipo_analizado}->{'usuario'}
 			);
 			if (!defined $session) {
 				print "Error en consulta SNMP:\t$error\n";
 				exit(-1);
-			} else {
-				my $result = $session->get_bulk_request(
-					-callback       => [\&table_cb, {}],
-					-maxrepetitions => 10,
-					-varbindlist    => [$OIDdot1dTpFdbTable]
-				);
+			} 
+			my $result = $session->get_bulk_request(
+				-callback       => [\&table_cb, {}],
+				-maxrepetitions => 10,
+				-varbindlist    => [$OIDdot1dTpFdbTable]
+			);
 
-				if (!defined $result) {
-					printf "ERROR: %s\n", $session->error();
-					$session->close();
-					exit (-1);
+			if (!defined $result) {
+				printf "ERROR: %s\n", $session->error();
+				$session->close();
+				exit (-1);
+			}
+
+			snmp_dispatcher();
+    			$session->close();
+
+
+			if (defined(\%PuertoAnalizado)) {
+				printf("\nEl equipo fue encontrado en el puerto %s del switch %s (%s).\n", $PuertoAnalizado{'puerto'}, $equipo_analizado, $PuertoAnalizado{'nombre'});
+				if ($PuertoAnalizado{'cantidad de hosts'} == 1) {
+					exit(0);
+				} else {
+					printf("\nLa cantidad de equipos conectados a ese puerto es de %s en total. Se sigue buscando.\n", $PuertoAnalizado{'cantidad de hosts'});
+					@nodos_a_analizar = ();
+
+					# Recorre la lista de equipos para determinar
+					# cuales están conectados al equipo encontrado
+					foreach my $equipo (keys(%equipos)) {
+						print STDERR "Switch $equipos{$equipo}->{'nombre'} con IP $equipos{$equipo}->{'ip'} conectado a $equipos{$equipo}->{'conectado'}\n" if $debug;
+#						if ($switches->{$switch}->{'conectado'} eq $PuertoAnalizado{'nombre'}) {
+						if ($equipos{$equipo}->{'conectado'} eq $equipo_analizado) {
+							print STDERR "Equipo $equipos{$equipo}->{'nombre'} con IP $equipos{$equipo}->{'ip'} conectado al equipo $equipos{$equipo}->{'conectado'}\n" if $debug;
+							# No puedo consultar equipo si no tiene IP de gestión
+							next if ($equipos{$equipo}->{'ip'} !~ m/^([01]?\d\d?|2[0-4]\d|25[0-5])\.([01]?\d\d?|2[0-4]\d|25[0-5])\.([01]?\d\d?|2[0-4]\d|25[0-5])\.([01]?\d\d?|2[0-4]\d|25[0-5])$/);
+
+							# No puedo consultar si es switch y no tiene SNMP
+							next if (($equipos{$equipo}->{'es switch'}) && ($equipos{$equipo}->{'usuario'} eq ''));
+
+							push(@nodos_a_analizar,  $equipos{$equipo}->{'nombre'});
+						}
+					}
+
+					if ((scalar @nodos_a_analizar) == 0) {
+						print STDERR "\n\n$target no se encontró. Existe un nodo no declarado o no administrable conectado al puerto $PuertoAnalizado{'puerto'} del equipo $equipo_analizado ($PuertoAnalizado{'nombre'})\n\n";
+						exit(0);
+					}
+
+	#print Dumper(@nodos_a_analizar) if $debug;
+					$equipo_analizado = $nodos_a_analizar[0];
+					print STDERR "\n\nSe continua buscando $target en el equipo $equipo_analizado\n\n";
+				}
+			} else {
+				my $trash = shift @nodos_a_analizar;
+
+				if ((scalar @nodos_a_analizar) == 0) {
+					print STDERR "\n\n$target no se encontró. Existe un nodo no declarado o no administrable conectado al puerto $PuertoAnalizado{'puerto'} del equipo $equipo_analizado ($PuertoAnalizado{'nombre'})\n\n";
+					exit(0);
 				}
 
-				snmp_dispatcher();
+	#print Dumper(@nodos_a_analizar) if $debug;
+				$equipo_analizado = $nodos_a_analizar[0];
+				print STDERR "\n\nSe continua buscando $target en el equipo $equipo_analizado\n\n";
+
 			}
-    			$session->close();
+
+		} else {
+			print "Es un AP. Saliendo.\n\n";
+			my $ssh = Net::SSH::Perl->new($equipos{$equipo_analizado}->{'ip'}, debug=>0);
+#			my $ssh = Net::SSH::Perl->new('10.0.13.105', debug=>0);
+			$ssh->login($equipos{$equipo_analizado}->{'usuario'},$ApPassword);
+			my ($stdout,$stderr,$exit) = $ssh->cmd($SshCmd);
+			print "Comando.\n\n";
+			my @lines = split /\n/, $stdout;
+			foreach my $line (@lines) {
+				next if ($line =~ /^ADDR/);
+				(my $convertida) = ($line =~ /^([^\s]*)/);
+				$convertida =~ s/://g;
+				$convertida = uc($convertida);
+#			print "$convertida\n";
+				if ($convertida eq $MacBuscado) {
+					printf("\nEl equipo está conectao por wi-fi al AP ubicado en %s (%s).\n", $equipos{$equipo_analizado}->{'nombre'}, $equipos{$equipo_analizado}->{'ip'});
+					exit(0);
+				}
+			}
+			my $trash = shift @nodos_a_analizar;
+
+			if ((scalar @nodos_a_analizar) == 0) {
+				print STDERR "\n\n$target no se encontró. Existe un nodo no declarado o no administrable conectado al puerto $PuertoAnalizado{'puerto'} del equipo $equipo_analizado ($PuertoAnalizado{'nombre'})\n\n";
+				exit(0);
+			}
+
+	#print Dumper(@nodos_a_analizar) if $debug;
+			$equipo_analizado = $nodos_a_analizar[0];
+			print STDERR "\n\nSe continua buscando $target en el equipo $equipo_analizado\n\n";
+
 		}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 	}
-
-} else {
-	print STDERR "No se encontraron switches\n" if $debug;
 }
-
-
-
-
-
-
-
-
 
 
 
@@ -218,34 +439,43 @@ sub table_cb
 			}
 		} else {
 			# We are no longer in the table, so print the results.
+			my %MacTable;
+			my %HostPorPuerto = ();
 			foreach my $oid (oid_lex_sort(keys(%{$table}))) {
 #				printf("%s %s\n", $oid, $OIDdot1dTpFdbAddress);
 				if ($oid =~ m/^$OIDdot1dTpFdbAddress/) {
-					(my $key) = ($oid =~ /^$OIDdot1dTpFdbAddress\.(.*)/);
-					my $temp = ($table->{$oid} =~ /^0x(.*)/);
-					$MacTable{$session->hostname}{$key}{'Address'} = uc($temp);
-				} elsif ($oid =~ m/^$OIDdot1dTpFdbPort/) {
-					(my $key) = ($oid =~ /^$OIDdot1dTpFdbPort\.(.*)/);
-					$MacTable{$session->hostname}{$key}{'Port'} = $table->{$oid};
-				} elsif ($oid =~ m/^$OIDdot1dTpFdbStatus/) {
-					(my $key) = ($oid =~ /^$OIDdot1dTpFdbStatus\.(.*)/);
-					$MacTable{$session->hostname}{$key}{'Status'} = $table->{$oid};
-				}
 
+					(my $llave) = ($oid =~ /^$OIDdot1dTpFdbAddress\.(.*)/);
+					(my $temp) = ($table->{$oid} =~ /^0x(.*)/);
+#printf("MAC %s\n", $temp);
+#					$MacTable{$session->hostname}{$llave}{'Address'} = uc($temp);
+					$MacTable{$llave}{'Address'} = uc($temp);
+				} elsif ($oid =~ m/^$OIDdot1dTpFdbPort/) {
+					(my $llave) = ($oid =~ /^$OIDdot1dTpFdbPort\.(.*)/);
+#					$MacTable{$session->hostname}{$llave}{'Port'} = $table->{$oid};
+					$MacTable{$llave}{'Port'} = $table->{$oid};
+
+					if (defined($HostPorPuerto{$table->{$oid}}) && ($HostPorPuerto{$table->{$oid}} =~ m/\d+/)) {
+						$HostPorPuerto{$table->{$oid}} = $HostPorPuerto{$table->{$oid}} + 1;
+					} else {
+						$HostPorPuerto{$table->{$oid}} = 0;
+					}
+				} elsif ($oid =~ m/^$OIDdot1dTpFdbStatus/) {
+					(my $llave) = ($oid =~ /^$OIDdot1dTpFdbStatus\.(.*)/);
+#					$MacTable{$session->hostname}{$llave}{'Status'} = $table->{$oid};
+					$MacTable{$llave}{'Status'} = $table->{$oid};
+				}
 #				printf("%s => %s\n", $oid, $table->{$oid});
 			}
 
-#			foreach my $key (keys %MacTable) {
-#				foreach my $target (keys %targets) {
-#					if ($targets{$target} eq $MacTable{$key}{'Address'}) {
-##						printf("%s ===> A: %s P: %s S: %s\n", $key, $MacTable{$key}{'Address'}, $MacTable{$key}{'Port'}, $MacTable{$key}{'Status'});
-#						printf("El equipo con dirección %s fue encontrado en el puerto %s del switch %s\n", $target, $MacTable{$key}{'Port'}, $session->hostname);
-#						$switch{$target} = $session->hostname;
-#						$puerto{$target} = $MacTable{$key}{'Port'};
-#						
-#					}
-#				}
-#			}
+			foreach my $key (keys %MacTable) {
+				if ($MacBuscado eq $MacTable{$key}{'Address'}) {
+					$PuertoAnalizado{'nombre'} = $session->hostname;
+					$PuertoAnalizado{'puerto'} = $MacTable{$key}{'Port'};
+					$PuertoAnalizado{'cantidad de hosts'} = $HostPorPuerto{$MacTable{$key}{'Port'}};
+					return;
+				}
+			}
 		}
 	}
 }

@@ -13,7 +13,7 @@ use vars qw($VERSION @ISA @EXPORT @EXPORT_OK %EXPORT_TAGS);
 
 use vars qw($debug $dbhost $dbbase $dbuser $dbpass &printOID);
 
-$debug = 1;
+$debug = 0;
 
 $dbhost =  'localhost';
 $dbbase =  'tecnica';
