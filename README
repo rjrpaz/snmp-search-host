@@ -1,0 +1,17 @@
+
+El programa "buscar_equipo", ubica un host conectado a una red
+compleja de switches y access points. Deben tenerse en cuenta
+las siguientes limitaciones:
+
+- Obtiene la información de switches y aps de una base de datos.
+La estructura de las tablas incluye los campos necesarios para
+saber como están entrelazados los equipos (switch A "cuelga" de
+switch B, o AP1 cuelga de switch C).
+
+- Los switchs son consultados por SNMP. La tabla en la base de
+datos incluye la información de la comunidad SNMP read-only.
+
+- Los aps son consultados por SSH. Están probados en APs
+Ubiquiti, que permiten este nivel de acceso, y además proveen
+comandos para obtener los equipos listados por Wifi.
+
