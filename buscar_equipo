@@ -1,7 +1,7 @@
 #!/usr/bin/perl
 use strict;
 use lib '.';
-use TresSesentaNet;
+use Datos;
 use DBI;
 use Net::SNMP qw(:snmp);
 use Data::Dumper;
@@ -15,7 +15,7 @@ use Net::SSH::Perl;
 # en los APs
 #
 my $ApUsuario = 'admin';
-my $ApPassword = 'ws!2004erilink';
+my $ApPassword = 'Put4P455w0rd';
 my $SshListaWifi = 'wlanconfig ath0 list station';
 my $SshListaEth = 'ifconfig';
 
